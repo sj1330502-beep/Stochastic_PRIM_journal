@@ -1,0 +1,265 @@
+"""
+================================================================================
+합의영역(Consensus Region) 방식 vs 원논문 (콘크리트 데이터)
+================================================================================
+지금까지의 모든 방식(ECC, 방식0~4, 파레토, 순위합 등)은 결국 (K, N_Memb)
+'하나의 조합'을 골라 그 1등 클러스터를 답으로 삼았다. 그리고 그 '고르는
+기준'이 무엇이든 단조적인 곡선 위의 한 점이라 계속 경계로 쏠리는 문제를
+겪었다.
+
+이번 방식은 다르다: (K, N_Memb) 조합을 아주 다양하게(격자 전체) 돌려보고,
+매번 나오는 '1등(최대) 클러스터'가 포함하는 training 관측치들을 전부 기록해
+'투표'로 집계한다. 그리고 '여러 설정에서 반복적으로 뽑히는(=합의도가 높은)'
+관측치들만 모아 그 관측치들의 최소~최대 범위를 최종 운전영역으로 삼는다.
+따로 고르는 계산식(가중치, 지수, 페널티)이 없고, 어느 한 극단적 설정에도
+의존하지 않는다는 게 핵심 차이다.
+================================================================================
+"""
+import os
+import numpy as np
+import pandas as pd
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(HERE, 'concrete_dataset.csv')
+
+TRAIN_RATIO = 0.7
+SPLIT_SEEDS = list(range(10))   # 서로 다른 10개의 training/confirmation 분할
+
+ALPHA_PEEL, MIN_SUPPORT = 0.05, 100
+S_OPTIONS, T_PER_SIZE, SEED_PRIM = (4, 5, 6), 667, 1
+K_GRID_STEP = 5
+RHO_LIMIT_BASELINE = 0.60
+N_MEMB_OPTIONS = [5, 6, 7, 8, 9, 10]
+
+METHOD4_ABC = dict(a=0.2, b=0.2, c=30.0)
+
+
+def make_desirability(y_all):
+    lower, upper = float(y_all.min()), float(y_all.max())
+    def d_func(y):
+        y = np.asarray(y, dtype=float)
+        d = np.zeros_like(y)
+        m1 = (y >= lower) & (y <= 60.0)
+        d[m1] = (y[m1] - lower) / (60.0 - lower)
+        m2 = (y > 60.0) & (y <= upper)
+        d[m2] = (upper - y[m2]) / (upper - 60.0)
+        return np.clip(d, 0.0, 1.0)
+    return d_func
+
+
+def peel_trajectory(X, D, S, rng):
+    P = X.shape[1]
+    idx = np.arange(len(D))
+    best_idx, best_obj = idx.copy(), D.mean()
+    while True:
+        if len(idx) * (1 - ALPHA_PEEL) < MIN_SUPPORT:
+            break
+        feats = rng.choice(P, size=S, replace=False)
+        cand_keep, cand_obj = None, -np.inf
+        for p in feats:
+            xp = X[idx, p]
+            lo_q, hi_q = np.quantile(xp, ALPHA_PEEL), np.quantile(xp, 1 - ALPHA_PEEL)
+            for keep in (idx[xp > lo_q], idx[xp < hi_q]):
+                if MIN_SUPPORT <= len(keep) < len(idx):
+                    obj = D[keep].mean()
+                    if obj > cand_obj:
+                        cand_obj, cand_keep = obj, keep
+        if cand_keep is None:
+            break
+        idx = cand_keep
+        if cand_obj > best_obj:
+            best_obj, best_idx = cand_obj, idx.copy()
+    return best_idx, best_obj
+
+
+def build_boxes(X, D):
+    rng = np.random.default_rng(SEED_PRIM)
+    boxes, total, done = [], len(S_OPTIONS) * T_PER_SIZE, 0
+    for S in S_OPTIONS:
+        for _ in range(T_PER_SIZE):
+            idx, obj = peel_trajectory(X, D, S, rng)
+            if len(idx) >= MIN_SUPPORT:
+                boxes.append({'idx': idx, 'support': len(idx), 'dbar': obj})
+            done += 1
+            if done % 300 == 0:
+                print(f'    trial {done}/{total} | 박스 {len(boxes)}개', flush=True)
+    return boxes
+
+
+def build_linkage(boxes):
+    M = len(boxes)
+    sets = [set(b['idx'].tolist()) for b in boxes]
+    sup = np.array([b['support'] for b in boxes], dtype=float)
+    inter = np.zeros((M, M))
+    for i in range(M):
+        for j in range(i + 1, M):
+            inter[i, j] = inter[j, i] = len(sets[i] & sets[j])
+    np.fill_diagonal(inter, sup)
+    sim = inter / (sup[:, None] + sup[None, :] - inter)
+    dist = np.clip(1.0 - sim, 0, 1.0)
+    np.fill_diagonal(dist, 0.0); dist = (dist + dist.T) / 2; np.fill_diagonal(dist, 0.0)
+    return linkage(squareform(dist, checks=False), method='average'), sets, M
+
+
+def precompute_raw_clusters(Z, sets, boxes, M, k_grid):
+    raw = {}
+    for K in k_grid:
+        lab = fcluster(Z, K, criterion='maxclust')
+        clusters = []
+        for k in np.unique(lab):
+            mem = np.where(lab == k)[0]
+            I = set.intersection(*[sets[m] for m in mem])
+            U = set.union(*[sets[m] for m in mem])
+            gamma = len(I) / len(U) if U else 0.0
+            dbar = np.mean([boxes[i]['dbar'] for i in mem])
+            clusters.append(dict(mem=mem, n=len(mem), gamma=gamma, dbar=dbar))
+        raw[K] = clusters
+    return raw
+
+
+def effective_clusters(raw_clusters_at_K, n_memb):
+    return [c for c in raw_clusters_at_K if c['n'] >= n_memb]
+
+
+def largest_of(eff):
+    return max(eff, key=lambda c: c['n'])
+
+
+def eval_ecc_rho(eff, M):
+    if not eff:
+        return None
+    rho = sum(c['n'] for c in eff) / M
+    ecc = np.mean([c['gamma'] for c in eff])
+    largest = largest_of(eff)
+    return dict(ecc=ecc, rho=rho, dbar=largest['dbar'])
+
+
+def cluster_range(boxes, X_train, mem):
+    all_idx = np.concatenate([boxes[i]['idx'] for i in mem])
+    return X_train[all_idx].min(axis=0), X_train[all_idx].max(axis=0)
+
+
+def eval_range_on_confirm(lo, hi, X_confirm, D_confirm):
+    mask = np.all((X_confirm >= lo) & (X_confirm <= hi), axis=1)
+    n = int(mask.sum())
+    d_mean = float(D_confirm[mask].mean()) if n > 0 else float('nan')
+    return d_mean, n
+
+
+def full_search_original(raw, M, k_grid, n_memb_options, rho_limit=RHO_LIMIT_BASELINE):
+    best = None
+    for n_memb in n_memb_options:
+        for K in k_grid:
+            eff = effective_clusters(raw[K], n_memb)
+            v = eval_ecc_rho(eff, M)
+            if v is None or v['rho'] < rho_limit:
+                continue
+            if best is None or v['ecc'] > best[2]['ecc']:
+                largest_mem = largest_of(eff)['mem']
+                best = (n_memb, K, v, largest_mem)
+    return best
+
+
+def full_search_method4(raw, M, k_grid, n_memb_options, a, b, c):
+    best = None
+    for n_memb in n_memb_options:
+        for K in k_grid:
+            eff = effective_clusters(raw[K], n_memb)
+            v = eval_ecc_rho(eff, M)
+            if v is None:
+                continue
+            d = max(v['dbar'], 1e-6)
+            score = (v['ecc'] ** a) * (v['rho'] ** b) * (d ** c)
+            if best is None or score > best[3]:
+                largest_mem = largest_of(eff)['mem']
+                best = (n_memb, K, v, score, largest_mem)
+    return best
+
+
+def run_one_seed(df, split_seed):
+    X_all = df.iloc[:, :8].values.astype(float)
+    y_all = df.iloc[:, 8].values.astype(float)
+
+    rng_split = np.random.default_rng(split_seed)
+    n = len(y_all)
+    perm = rng_split.permutation(n)
+    n_train = int(n * TRAIN_RATIO)
+    train_idx, confirm_idx = perm[:n_train], perm[n_train:]
+    X_train, y_train = X_all[train_idx], y_all[train_idx]
+    X_confirm = X_all[confirm_idx]
+
+    d_func = make_desirability(y_all)
+    D_train = d_func(y_train)
+    D_confirm = d_func(y_all[confirm_idx])
+
+    boxes = build_boxes(X_train, D_train)
+    if len(boxes) < 10:
+        return None
+    Z, sets, M = build_linkage(boxes)
+    k_grid = list(range(int(M * 0.05), int(M * 0.50) + 1, K_GRID_STEP))
+    raw = precompute_raw_clusters(Z, sets, boxes, M, k_grid)
+
+    res_o = full_search_original(raw, M, k_grid, N_MEMB_OPTIONS)
+    if res_o is None:
+        return None
+    n_memb_o, K_o, v_o, mem_o = res_o
+    lo_o, hi_o = cluster_range(boxes, X_train, mem_o)
+    d_o, n_o = eval_range_on_confirm(lo_o, hi_o, X_confirm, D_confirm)
+
+    res_4 = full_search_method4(raw, M, k_grid, N_MEMB_OPTIONS, **METHOD4_ABC)
+    if res_4 is None:
+        return None
+    n_memb_4, K_4, v_4, score_4, mem_4 = res_4
+    lo_4, hi_4 = cluster_range(boxes, X_train, mem_4)
+    d_4, n_4 = eval_range_on_confirm(lo_4, hi_4, X_confirm, D_confirm)
+
+    return dict(split_seed=split_seed, K_o=K_o, n_memb_o=n_memb_o, d_o=d_o, n_o=n_o,
+               K_4=K_4, n_memb_4=n_memb_4, d_4=d_4, n_4=n_4)
+
+
+def main():
+    df = pd.read_csv(CSV_PATH, encoding='utf-8-sig')
+
+    print('=' * 90)
+    print(f'  서로 다른 {len(SPLIT_SEEDS)}개 training/confirmation 분할로 반복 검증')
+    print(f'  (원논문 vs 방식4[a={METHOD4_ABC["a"]},b={METHOD4_ABC["b"]},c={METHOD4_ABC["c"]}])')
+    print('=' * 90)
+
+    results = []
+    for seed in SPLIT_SEEDS:
+        print(f'\n[분할 시드={seed}] 실행 중 ...')
+        r = run_one_seed(df, seed)
+        if r is None:
+            print('  실패, 건너뜀')
+            continue
+        results.append(r)
+        diff = r['d_4'] - r['d_o']
+        print(f'  기존: K*={r["K_o"]}, D_conf={r["d_o"]:.4f} (n={r["n_o"]})')
+        print(f'  방식4: K*={r["K_4"]}, D_conf={r["d_4"]:.4f} (n={r["n_4"]}), 차이={diff:+.4f}')
+
+    print('\n' + '=' * 90)
+    print('  종합 (분할 시드별 요약)')
+    print('=' * 90)
+    print(f'  {"시드":>6} {"기존 D_conf":>12} {"방식4 D_conf":>13} {"차이":>9}')
+    diffs = []
+    for r in results:
+        diff = r['d_4'] - r['d_o']
+        diffs.append(diff)
+        print(f'  {r["split_seed"]:>6} {r["d_o"]:>12.4f} {r["d_4"]:>13.4f} {diff:>+9.4f}')
+
+    if diffs:
+        wins = sum(1 for d in diffs if d >= 0)
+        strict_wins = sum(1 for d in diffs if d > 0)
+        ties = sum(1 for d in diffs if d == 0)
+        print(f'\n  방식4가 기존과 같거나 능가한 분할 수: {wins}/{len(diffs)} '
+              f'(확실히 능가 {strict_wins}, 동률 {ties})')
+        print(f'  평균 차이: {np.mean(diffs):+.4f}')
+        print(f'  차이의 표준편차: {np.std(diffs):.4f}')
+
+    print('\n완료.')
+
+
+if __name__ == '__main__':
+    main()
