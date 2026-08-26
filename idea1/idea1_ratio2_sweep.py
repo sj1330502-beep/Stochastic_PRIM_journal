@@ -33,7 +33,7 @@ SPLIT_SEED = 0
 INNER_TRAIN_RATIO = 0.7
 INNER_SPLIT_SEED = 1
 
-ALPHA_PEEL, MIN_SUPPORT = 0.05, 100
+ALPHA_PEEL, MIN_SUPPORT = 0.05, 75   # inner training 504행 대비 약 15%
 S_OPTIONS, T_PER_SIZE, SEED_PRIM = (4, 5, 6), 667, 1
 
 N_MEMB_OPTIONS = [5, 6, 7, 8, 9, 10]
@@ -42,6 +42,11 @@ K_GRID_STEP = 25
 
 MIN_SUPPORT2_FLOOR = 20
 RATIO2_GRID = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+# RATIO2 선택 제약: D_valid 만 최대화하면 항상 그리드 최솟값이 뽑히므로,
+# 수축 후에도 남아야 할 validation 표본 수의 하한을 함께 건다.
+MIN_VALID_FLOOR = 25       # 절대 하한 (평균 표본 수)
+MIN_VALID_RETAIN = 0.5     # 통합박스 시점 대비 유지해야 할 비율
 
 TOPN_CLUSTERS = 10
 FEAT_NAMES = ['Cement', 'Slag', 'FlyAsh', 'Water', 'Superplast',
@@ -259,13 +264,18 @@ def sweep_ratio2(clusters, boxes, X_train, D_train, X_validation, D_validation):
         in_box = np.all((X_train >= lo0) & (X_train <= hi0), axis=1)
         X_sub, D_sub = X_train[in_box], D_train[in_box]
         n_box = int(in_box.sum())
-        d_before, _ = holdout_eval(lo0, hi0, X_validation, D_validation)
-        precomputed.append((cid, lo0, hi0, X_sub, D_sub, n_box, d_before))
+        d_before, n_before = holdout_eval(lo0, hi0, X_validation, D_validation)
+        precomputed.append((cid, lo0, hi0, X_sub, D_sub, n_box, d_before, n_before))
+
+    mean_n_before = np.mean([p[7] for p in precomputed])
+    min_valid = max(MIN_VALID_FLOOR, MIN_VALID_RETAIN * mean_n_before)
+    print(f'  수축 전 평균 n_valid={mean_n_before:.1f} → '
+          f'채택 조건: 평균 n_valid(후) >= {min_valid:.1f}')
 
     sweep_results = []
     for ratio2 in RATIO2_GRID:
         d_afters, diffs, n_afters, zero_count = [], [], [], 0
-        for cid, lo0, hi0, X_sub, D_sub, n_box, d_before in precomputed:
+        for cid, lo0, hi0, X_sub, D_sub, n_box, d_before, _ in precomputed:
             min_support2 = max(MIN_SUPPORT2_FLOOR, int(n_box * ratio2))
             lo, hi, _, _ = peel_within_box(X_sub, D_sub, lo0, hi0, min_support2)
             d_after, n_after = holdout_eval(lo, hi, X_validation, D_validation)
@@ -285,9 +295,18 @@ def sweep_ratio2(clusters, boxes, X_train, D_train, X_validation, D_validation):
         print(f'  {ratio2:>7.1f} {mean_d:>15.4f} {mean_diff:>+11.4f} '
               f'{mean_n:>15.1f} {zero_ratio:>14.1%}')
 
-    valid = [r for r in sweep_results if r[4] < 0.5 and not np.isnan(r[1])]
-    best = max(valid, key=lambda r: r[1]) if valid else max(
-        sweep_results, key=lambda r: (not np.isnan(r[1]), r[1]))
+    usable = [r for r in sweep_results if r[4] < 0.5 and not np.isnan(r[1])]
+    feasible = [r for r in usable if r[3] >= min_valid]
+    dropped = [r for r in usable if r[3] < min_valid]
+    if dropped:
+        print(f'\n  [제외] 평균 n_valid(후) < {min_valid:.1f}: '
+              + ', '.join(f'{r[0]:.1f}(n={r[3]:.1f})' for r in dropped))
+    if feasible:
+        best = max(feasible, key=lambda r: r[1])
+    else:
+        print(f'\n  [주의] 표본 수 하한을 만족하는 RATIO2가 없어 '
+              f'표본을 가장 많이 남기는 후보를 사용한다.')
+        best = max(sweep_results, key=lambda r: (not np.isnan(r[3]), r[3]))
     print(f'\n  ▶ 채택 RATIO2 = {best[0]} '
           f'(평균 D_valid(후)={best[1]:.4f}, 평균 개선폭={best[2]:+.4f}, '
           f'평균 n_valid(후)={best[3]:.1f})')
