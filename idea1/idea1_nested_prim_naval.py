@@ -31,7 +31,7 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(HERE, 'naval_propulsion_dataset.csv')
+CSV_PATH = os.path.join(HERE, '..', 'naval_propulsion_dataset.csv')
 CACHE_DIR = os.path.join(os.path.expanduser('~'), '.cache',
                          'stochastic_prim_journal', 'idea1')
 CACHE_VERSION = 'ratio2-nested-v1'
@@ -380,7 +380,7 @@ def evaluate_on_confirmation(clusters, boxes, X_train, D_train,
 # ============================================= 실행
 def main():
     if not os.path.exists(CSV_PATH):
-        raise FileNotFoundError('naval_propulsion_dataset.csv 를 같은 폴더에 두세요.')
+        raise FileNotFoundError('저장소 루트에 naval_propulsion_dataset.csv 를 두세요.')
     df = pd.read_csv(CSV_PATH)
 
     feat_names = [c for c in df.columns

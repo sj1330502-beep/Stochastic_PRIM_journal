@@ -20,7 +20,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(HERE, '..', 'idea1', 'naval_propulsion_dataset.csv')
+CSV_PATH = os.path.join(HERE, '..', 'naval_propulsion_dataset.csv')
 CACHE_DIR = os.path.join(os.path.expanduser('~'), '.cache',
                          'stochastic_prim_journal', 'idea2')
 CACHE_VERSION = 'naval-jaccard-tversky-v1'
