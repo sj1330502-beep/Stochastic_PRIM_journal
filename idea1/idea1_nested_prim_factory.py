@@ -2,21 +2,20 @@
 ================================================================================
 아이디어 1번 최종판 — Multi-stage Factory Process 데이터
 ================================================================================
-콘크리트에서 확정한 최종 설계(완전 실측 기반, 예측모델/몬테카를로 없음,
-RATIO2 기반 2차 PRIM, deterministic peeling, N_Memb x K 완전탐색)를
-factory 데이터(14088행, 입력 41개, 다중반응 15개)에 그대로 이식한다.
+RATIO2 후보는 outer training 내부의 inner validation에서 선택하고, outer
+confirmation은 선택된 RATIO2의 최종 성능을 평가할 때 한 번만 사용한다.
 
-콘크리트 버전 대비 변경점
-  · desirability: 반응 15개를 원논문 식(1) 기하평균으로 집계
-    (각 반응 Target = 데이터의 실제 Setpoint)
-  · 박스 생성 하이퍼파라미터: min_support=250, subspace=(22,27,33) 등
-    데이터 규모/변수 수에 비례 조정 (기존 factory 실험과 동일 설정)
-  · 유사도 계산은 행렬곱으로 벡터화 (M, N 이 커서 필요)
-  · RATIO2(2차 PRIM의 min_support 비율)는 콘크리트에서 스윕한 0.4를
-    기본값으로 사용하되, 데이터가 다르므로 스윕도 함께 수행해 재확인한다.
+  outer training
+    ├─ inner training   : MRS-PRIM 박스/클러스터 생성
+    └─ inner validation : RATIO2 선택
+  outer confirmation    : 선택 완료 후 최종 성능 평가
+
+완전 실측 기반이며 예측모델/몬테카를로는 사용하지 않는다.
 ================================================================================
 """
+import hashlib
 import os
+
 import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -24,7 +23,9 @@ from scipy.spatial.distance import squareform
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(HERE, 'continuous_factory_process.csv')
-BOX_CACHE = os.path.join(HERE, 'boxes_factory_train.npy')
+CACHE_DIR = os.path.join(os.path.expanduser('~'), '.cache',
+                         'stochastic_prim_journal', 'idea1')
+CACHE_VERSION = 'ratio2-nested-v1'
 
 INPUT_COLS = [
     'AmbientConditions.AmbientHumidity.U.Actual',
@@ -58,6 +59,8 @@ N_RESPONSES = 15
 
 TRAIN_RATIO = 0.7
 SPLIT_SEED = 0
+INNER_TRAIN_RATIO = 0.7
+INNER_SPLIT_SEED = 1
 
 ALPHA_PEEL = 0.05
 MIN_SUPPORT = 250
@@ -75,19 +78,31 @@ RATIO2_GRID = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]   # 콘크리트에서 채택한 0.
 TOPN_CLUSTERS = 10
 
 
+# ============================================= 데이터 분할
+def split_indices(indices, train_ratio, seed):
+    indices = np.asarray(indices, dtype=int)
+    perm = np.random.default_rng(seed).permutation(len(indices))
+    n_train = int(len(indices) * train_ratio)
+    if n_train == 0 or n_train == len(indices):
+        raise ValueError('training과 hold-out에 각각 한 개 이상의 관측치가 필요합니다.')
+    return indices[perm[:n_train]], indices[perm[n_train:]]
+
+
 # ============================================= 다중반응 desirability (원논문 식1)
-def build_multi_desirability(df, idx=None):
+def build_multi_desirability(df, idx):
+    """학습 인덱스에서만 desirability 경계와 target을 추정한다."""
+    idx = np.asarray(idx, dtype=int)
     d_list, targets = [], []
     for i in range(N_RESPONSES):
         y_all = df[f'Stage1.Output.Measurement{i}.U.Actual'].values.astype(float)
-        sp = df[f'Stage1.Output.Measurement{i}.U.Setpoint']
+        y = y_all[idx]
+        sp = df[f'Stage1.Output.Measurement{i}.U.Setpoint'].iloc[idx]
         nonzero = sp[sp != 0]
         target = float(nonzero.mode().iloc[0]) if len(nonzero) else float(sp.mean())
-        lower, upper = float(y_all.min()), float(y_all.max())
+        lower, upper = float(y.min()), float(y.max())
         if upper <= target or target <= lower:
-            lower, upper, target = y_all.min(), y_all.max(), float(np.median(y_all))
+            target = float(np.median(y))
         targets.append((target, lower, upper))
-        y = y_all if idx is None else y_all[idx]
         d = np.zeros_like(y)
         m1 = (y >= lower) & (y <= target)
         d[m1] = (y[m1] - lower) / (target - lower) if target > lower else 1.0
@@ -153,6 +168,34 @@ def build_boxes(X, D):
     return boxes
 
 
+def boxes_cache_path(label, X, D):
+    """분할 데이터와 PRIM 설정이 같을 때만 같은 캐시를 사용한다."""
+    digest = hashlib.sha256()
+    digest.update(CACHE_VERSION.encode())
+    digest.update(repr((ALPHA_PEEL, MIN_SUPPORT, S_OPTIONS,
+                        T_PER_SIZE, SEED_PRIM)).encode())
+    for array in (X, D):
+        contiguous = np.ascontiguousarray(array)
+        digest.update(str(contiguous.shape).encode())
+        digest.update(str(contiguous.dtype).encode())
+        digest.update(contiguous.tobytes())
+    return os.path.join(CACHE_DIR, f'factory_{label}_{digest.hexdigest()[:16]}.npy')
+
+
+def load_or_build_boxes(label, X, D):
+    cache_path = boxes_cache_path(label, X, D)
+    if os.path.exists(cache_path):
+        boxes = list(np.load(cache_path, allow_pickle=True))
+        print(f'  [cache] 박스 {len(boxes)}개 로드: {os.path.basename(cache_path)}')
+        return boxes
+
+    boxes = build_boxes(X, D)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    np.save(cache_path, np.array(boxes, dtype=object), allow_pickle=True)
+    print(f'  박스 {len(boxes)}개 생성 및 저장: {os.path.basename(cache_path)}')
+    return boxes
+
+
 # ============================================= 클러스터링 (벡터화 유사도) + 완전탐색
 def build_linkage(boxes, N):
     M = len(boxes)
@@ -196,6 +239,17 @@ def full_grid_search(Z, sets, M):
     return all_candidates, final
 
 
+def find_effective_clusters(boxes, n_observations):
+    Z, sets, M = build_linkage(boxes, n_observations)
+    all_candidates, final = full_grid_search(Z, sets, M)
+    n_memb_star, K_star, N_eff_star, ecc_star, rho_star = final
+    lab = fcluster(Z, K_star, criterion='maxclust')
+    clusters = [(c, np.where(lab == c)[0]) for c in np.unique(lab)]
+    clusters = [(c, m) for c, m in clusters if len(m) >= n_memb_star]
+    clusters.sort(key=lambda x: -len(x[1]))
+    return clusters[:TOPN_CLUSTERS], final
+
+
 # ============================================= [2단계] 통합박스 내 2차 PRIM (완전 실측, deterministic)
 def peel_within_box(X_sub, D_sub, lo0, hi0, min_support2):
     P = X_sub.shape[1]
@@ -230,20 +284,20 @@ def peel_within_box(X_sub, D_sub, lo0, hi0, min_support2):
 
 
 # ============================================= Hold-out
-def holdout_eval(lo, hi, X_confirm, D_confirm):
-    mask = np.all((X_confirm >= lo) & (X_confirm <= hi), axis=1)
+def holdout_eval(lo, hi, X_holdout, D_holdout):
+    mask = np.all((X_holdout >= lo) & (X_holdout <= hi), axis=1)
     n = int(mask.sum())
-    d_mean = float(D_confirm[mask].mean()) if n > 0 else np.nan
+    d_mean = float(D_holdout[mask].mean()) if n > 0 else np.nan
     return d_mean, n
 
 
-# ============================================= RATIO2 스윕
-def sweep_ratio2(clusters, boxes, X_train, D_train, X_confirm, D_confirm):
+# ============================================= RATIO2 스윕 (inner validation 전용)
+def sweep_ratio2(clusters, boxes, X_train, D_train, X_validation, D_validation):
     print('=' * 78)
-    print('  RATIO2 스윕 (factory 데이터에서 재확인)')
+    print('  RATIO2 스윕 (inner validation에서 선택)')
     print('=' * 78)
-    print(f'  {"RATIO2":>7} {"평균D_conf(후)":>15} {"평균개선폭":>11} '
-          f'{"평균n_conf(후)":>15} {"n_conf=0 비율":>13}')
+    print(f'  {"RATIO2":>7} {"평균D_valid(후)":>15} {"평균개선폭":>11} '
+          f'{"평균n_valid(후)":>15} {"n_valid=0 비율":>15}')
 
     precomputed = []
     for cid, mem in clusters:
@@ -252,7 +306,7 @@ def sweep_ratio2(clusters, boxes, X_train, D_train, X_confirm, D_confirm):
         in_box = np.all((X_train >= lo0) & (X_train <= hi0), axis=1)
         X_sub, D_sub = X_train[in_box], D_train[in_box]
         n_box = int(in_box.sum())
-        d_before, n_before = holdout_eval(lo0, hi0, X_confirm, D_confirm)
+        d_before, _ = holdout_eval(lo0, hi0, X_validation, D_validation)
         precomputed.append((cid, lo0, hi0, X_sub, D_sub, n_box, d_before))
 
     sweep_results = []
@@ -260,8 +314,8 @@ def sweep_ratio2(clusters, boxes, X_train, D_train, X_confirm, D_confirm):
         d_afters, diffs, n_afters, zero_count = [], [], [], 0
         for cid, lo0, hi0, X_sub, D_sub, n_box, d_before in precomputed:
             min_support2 = max(MIN_SUPPORT2_FLOOR, int(n_box * ratio2))
-            lo, hi, obj_final, n_final = peel_within_box(X_sub, D_sub, lo0, hi0, min_support2)
-            d_after, n_after = holdout_eval(lo, hi, X_confirm, D_confirm)
+            lo, hi, _, _ = peel_within_box(X_sub, D_sub, lo0, hi0, min_support2)
+            d_after, n_after = holdout_eval(lo, hi, X_validation, D_validation)
             if n_after == 0:
                 zero_count += 1
                 continue
@@ -275,15 +329,48 @@ def sweep_ratio2(clusters, boxes, X_train, D_train, X_confirm, D_confirm):
         zero_ratio = zero_count / len(precomputed)
         sweep_results.append((ratio2, mean_d, mean_diff, mean_n, zero_ratio))
         print(f'  {ratio2:>7.1f} {mean_d:>15.4f} {mean_diff:>+11.4f} '
-              f'{mean_n:>15.1f} {zero_ratio:>12.1%}')
+              f'{mean_n:>15.1f} {zero_ratio:>14.1%}')
 
     valid = [r for r in sweep_results if r[4] < 0.5 and not np.isnan(r[1])]
     best = max(valid, key=lambda r: r[1]) if valid else max(
         sweep_results, key=lambda r: (not np.isnan(r[1]), r[1]))
     print(f'\n  ▶ 채택 RATIO2 = {best[0]} '
-          f'(평균 D_conf(후)={best[1]:.4f}, 평균 개선폭={best[2]:+.4f}, '
-          f'평균 n_conf(후)={best[3]:.1f})')
+          f'(평균 D_valid(후)={best[1]:.4f}, 평균 개선폭={best[2]:+.4f}, '
+          f'평균 n_valid(후)={best[3]:.1f})')
     return best[0]
+
+
+def evaluate_on_confirmation(clusters, boxes, X_train, D_train,
+                             X_confirm, D_confirm, ratio2):
+    print(f'\n[4] RATIO2={ratio2} 고정 후 outer confirmation 최종 평가')
+    print(f'\n  {"클러스터":>7} {"멤버":>4} {"n_box":>6} {"min_sup2":>8} '
+          f'{"D_conf(전)":>11} {"D_conf(후)":>11} {"개선폭":>8} '
+          f'{"n_conf(전)":>10} {"n_conf(후)":>10}')
+    diffs, improved = [], 0
+    for cid, mem in clusters:
+        all_idx = np.concatenate([boxes[i]['idx'] for i in mem])
+        lo0, hi0 = X_train[all_idx].min(axis=0), X_train[all_idx].max(axis=0)
+        in_box = np.all((X_train >= lo0) & (X_train <= hi0), axis=1)
+        X_sub, D_sub = X_train[in_box], D_train[in_box]
+        n_box = int(in_box.sum())
+        min_support2 = max(MIN_SUPPORT2_FLOOR, int(n_box * ratio2))
+
+        lo, hi, _, _ = peel_within_box(X_sub, D_sub, lo0, hi0, min_support2)
+        d_before, n_before = holdout_eval(lo0, hi0, X_confirm, D_confirm)
+        d_after, n_after = holdout_eval(lo, hi, X_confirm, D_confirm)
+
+        diff = d_after - d_before if not (np.isnan(d_before) or np.isnan(d_after)) else float('nan')
+        if not np.isnan(diff):
+            diffs.append(diff)
+            if diff > 0:
+                improved += 1
+        print(f'  {cid:>7} {len(mem):>4} {n_box:>6} {min_support2:>8} '
+              f'{d_before:>11.4f} {d_after:>11.4f} {diff:>+8.4f} '
+              f'{n_before:>10} {n_after:>10}')
+
+    if diffs:
+        print(f'\n  → 개선된 클러스터: {improved}/{len(diffs)} '
+              f'({100 * improved / len(diffs):.1f}%), 평균 개선폭={np.mean(diffs):+.4f}')
 
 
 # ============================================= 실행
@@ -295,70 +382,53 @@ def main():
     n = len(df)
     print(f'데이터 {n}행, 입력 {X_all.shape[1]}개, 반응 {N_RESPONSES}개(다중반응)')
 
-    rng_split = np.random.default_rng(SPLIT_SEED)
-    perm = rng_split.permutation(n)
-    n_train = int(n * TRAIN_RATIO)
-    train_idx, confirm_idx = perm[:n_train], perm[n_train:]
-    X_train = X_all[train_idx]
+    outer_train_idx, confirm_idx = split_indices(
+        np.arange(n), TRAIN_RATIO, SPLIT_SEED)
+    inner_train_idx, validation_idx = split_indices(
+        outer_train_idx, INNER_TRAIN_RATIO, INNER_SPLIT_SEED)
+    print(f'[0] outer 분할: training {len(outer_train_idx)}개 / '
+          f'confirmation {len(confirm_idx)}개')
+    print(f'    inner 분할: training {len(inner_train_idx)}개 / '
+          f'validation {len(validation_idx)}개')
+
+    # ---------- inner validation에서 RATIO2 선택 ----------
+    X_inner_train = X_all[inner_train_idx]
+    D_inner_train, inner_targets = build_multi_desirability(df, inner_train_idx)
+    X_validation = X_all[validation_idx]
+    D_validation = desirability_from_targets(df, validation_idx, inner_targets)
+
+    print('\n[1] inner training 데이터로 RATIO2 선택용 MRS-PRIM 박스 생성')
+    inner_boxes = load_or_build_boxes('inner', X_inner_train, D_inner_train)
+    inner_clusters, inner_final = find_effective_clusters(
+        inner_boxes, len(X_inner_train))
+    print(f'  ▶ inner 채택: N_Memb*={inner_final[0]}, K*={inner_final[1]} '
+          f'(N_eff={inner_final[2]}, ECC={inner_final[3]:.4f}, '
+          f'rho_eff={inner_final[4]:.3f})')
+
+    print('\n[2] outer confirmation을 보지 않고 RATIO2 선택')
+    best_ratio2 = sweep_ratio2(
+        inner_clusters, inner_boxes, X_inner_train, D_inner_train,
+        X_validation, D_validation)
+
+    # ---------- outer training 전체로 최종 파이프라인 재구축 ----------
+    X_outer_train = X_all[outer_train_idx]
+    D_outer_train, outer_targets = build_multi_desirability(df, outer_train_idx)
     X_confirm = X_all[confirm_idx]
-    print(f'[0] 분할: training {len(train_idx)}개 / confirmation {len(confirm_idx)}개')
+    D_confirm = desirability_from_targets(df, confirm_idx, outer_targets)
 
-    D_train, targets = build_multi_desirability(df, idx=train_idx)
-    D_confirm = desirability_from_targets(df, confirm_idx, targets)
+    print('\n[3] outer training 전체로 최종 MRS-PRIM 재구축')
+    outer_boxes = load_or_build_boxes('outer', X_outer_train, D_outer_train)
+    outer_clusters, outer_final = find_effective_clusters(
+        outer_boxes, len(X_outer_train))
+    print(f'  ▶ outer 채택: N_Memb*={outer_final[0]}, K*={outer_final[1]} '
+          f'(N_eff={outer_final[2]}, ECC={outer_final[3]:.4f}, '
+          f'rho_eff={outer_final[4]:.3f})')
 
-    print('\n[1] training 데이터로 MRS-PRIM 박스 생성')
-    if os.path.exists(BOX_CACHE):
-        boxes = list(np.load(BOX_CACHE, allow_pickle=True))
-        print(f'  [cache] 박스 {len(boxes)}개 로드')
-    else:
-        boxes = build_boxes(X_train, D_train)
-        np.save(BOX_CACHE, np.array(boxes, dtype=object), allow_pickle=True)
-        print(f'  박스 {len(boxes)}개 생성 및 저장')
+    evaluate_on_confirmation(
+        outer_clusters, outer_boxes, X_outer_train, D_outer_train,
+        X_confirm, D_confirm, best_ratio2)
 
-    print('\n[2] N_Memb x K 완전 격자탐색')
-    Z, sets, M = build_linkage(boxes, len(df))
-    all_candidates, final = full_grid_search(Z, sets, M)
-    n_memb_star, K_star, N_eff_star, ecc_star, rho_star = final
-    print(f'  ▶ 채택: N_Memb*={n_memb_star}, K*={K_star} '
-          f'(N_eff={N_eff_star}, ECC={ecc_star:.4f}, rho_eff={rho_star:.3f})')
-
-    lab = fcluster(Z, K_star, criterion='maxclust')
-    clusters = [(c, np.where(lab == c)[0]) for c in np.unique(lab)]
-    clusters = [(c, m) for c, m in clusters if len(m) >= n_memb_star]
-    clusters.sort(key=lambda x: -len(x[1]))
-    clusters = clusters[:TOPN_CLUSTERS]
-
-    best_ratio2 = sweep_ratio2(clusters, boxes, X_train, D_train, X_confirm, D_confirm)
-
-    print(f'\n[3] 채택된 RATIO2={best_ratio2} 로 최종 수축 수행')
-    print(f'\n  {"클러스터":>7} {"멤버":>4} {"n_box":>6} {"min_sup2":>8} {"D_conf(전)":>11} '
-          f'{"D_conf(후)":>11} {"개선폭":>8} {"n_conf(전)":>10} {"n_conf(후)":>10}')
-    diffs, improved = [], 0
-    for cid, mem in clusters:
-        all_idx = np.concatenate([boxes[i]['idx'] for i in mem])
-        lo0, hi0 = X_train[all_idx].min(axis=0), X_train[all_idx].max(axis=0)
-        in_box = np.all((X_train >= lo0) & (X_train <= hi0), axis=1)
-        X_sub, D_sub = X_train[in_box], D_train[in_box]
-        n_box = int(in_box.sum())
-        min_support2 = max(MIN_SUPPORT2_FLOOR, int(n_box * best_ratio2))
-
-        lo, hi, obj_final, n_final = peel_within_box(X_sub, D_sub, lo0, hi0, min_support2)
-        d_before, n_before = holdout_eval(lo0, hi0, X_confirm, D_confirm)
-        d_after, n_after = holdout_eval(lo, hi, X_confirm, D_confirm)
-
-        diff = d_after - d_before if not (np.isnan(d_before) or np.isnan(d_after)) else float('nan')
-        if not np.isnan(diff):
-            diffs.append(diff)
-            if diff > 0:
-                improved += 1
-        print(f'  {cid:>7} {len(mem):>4} {n_box:>6} {min_support2:>8} {d_before:>11.4f} '
-              f'{d_after:>11.4f} {diff:>+8.4f} {n_before:>10} {n_after:>10}')
-
-    if diffs:
-        print(f'\n  → 개선된 클러스터: {improved}/{len(diffs)} '
-              f'({100*improved/len(diffs):.1f}%), 평균 개선폭={np.mean(diffs):+.4f}')
-
-    print('\n완료. (예측모델/몬테카를로 미사용, 전 과정 실측 기반)')
+    print('\n완료. (RATIO2 선택=inner validation, 최종 평가=outer confirmation)')
 
 
 if __name__ == '__main__':
