@@ -1,7 +1,12 @@
 """
 ================================================================================
-아이디어 1번 최종판 — Multi-stage Factory Process 데이터
+아이디어 1번 — Naval Propulsion (CBM) 데이터
 ================================================================================
+콘크리트/factory와 동일한 설계를 그대로 이식한다.
+  · 완전 실측 기반 (예측모델/몬테카를로 없음)
+  · MRS-PRIM 박스 생성 → 경험적 Jaccard → average-linkage → N_Memb x K 완전탐색
+  · 통합박스 내부 2차 PRIM (deterministic peeling)
+
 RATIO2 후보는 outer training 내부의 inner validation에서 선택하고, outer
 confirmation은 선택된 RATIO2의 최종 성능을 평가할 때 한 번만 사용한다.
 
@@ -10,7 +15,11 @@ confirmation은 선택된 RATIO2의 최종 성능을 평가할 때 한 번만 �
     └─ inner validation : RATIO2 선택
   outer confirmation    : 선택 완료 후 최종 성능 평가
 
-완전 실측 기반이며 예측모델/몬테카를로는 사용하지 않는다.
+데이터 특성 메모
+  · 11,934행 = lever 9수준 x 압축기감쇠 51수준 x 터빈감쇠 26수준 (완전 요인)
+  · 상수 컬럼(T1, P1)과 중복 컬럼(Tp = Ts)은 입력에서 제외한다.
+  · 반응 2개(압축기/터빈 감쇠계수)는 1.0 = 정상, 작을수록 열화이므로
+    LTB(larger-the-better) desirability 를 원논문 식(1) 기하평균으로 집계한다.
 ================================================================================
 """
 import hashlib
@@ -22,40 +31,21 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(HERE, 'continuous_factory_process.csv')
+CSV_PATH = os.path.join(HERE, '..', 'naval_propulsion_dataset.csv')
 CACHE_DIR = os.path.join(os.path.expanduser('~'), '.cache',
                          'stochastic_prim_journal', 'idea1')
 CACHE_VERSION = 'ratio2-nested-v1'
 
-INPUT_COLS = [
-    'AmbientConditions.AmbientHumidity.U.Actual',
-    'AmbientConditions.AmbientTemperature.U.Actual',
-    'Machine1.RawMaterial.Property1', 'Machine1.RawMaterial.Property2',
-    'Machine1.RawMaterial.Property3', 'Machine1.RawMaterial.Property4',
-    'Machine1.RawMaterialFeederParameter.U.Actual',
-    'Machine1.Zone1Temperature.C.Actual', 'Machine1.Zone2Temperature.C.Actual',
-    'Machine1.MotorAmperage.U.Actual', 'Machine1.MotorRPM.C.Actual',
-    'Machine1.MaterialPressure.U.Actual', 'Machine1.MaterialTemperature.U.Actual',
-    'Machine1.ExitZoneTemperature.C.Actual',
-    'Machine2.RawMaterial.Property1', 'Machine2.RawMaterial.Property2',
-    'Machine2.RawMaterial.Property3', 'Machine2.RawMaterial.Property4',
-    'Machine2.RawMaterialFeederParameter.U.Actual',
-    'Machine2.Zone1Temperature.C.Actual', 'Machine2.Zone2Temperature.C.Actual',
-    'Machine2.MotorAmperage.U.Actual', 'Machine2.MotorRPM.C.Actual',
-    'Machine2.MaterialPressure.U.Actual', 'Machine2.MaterialTemperature.U.Actual',
-    'Machine2.ExitZoneTemperature.C.Actual',
-    'Machine3.RawMaterial.Property1', 'Machine3.RawMaterial.Property2',
-    'Machine3.RawMaterial.Property3', 'Machine3.RawMaterial.Property4',
-    'Machine3.RawMaterialFeederParameter.U.Actual',
-    'Machine3.Zone1Temperature.C.Actual', 'Machine3.Zone2Temperature.C.Actual',
-    'Machine3.MotorAmperage.U.Actual', 'Machine3.MotorRPM.C.Actual',
-    'Machine3.MaterialPressure.U.Actual', 'Machine3.MaterialTemperature.U.Actual',
-    'Machine3.ExitZoneTemperature.C.Actual',
-    'FirstStage.CombinerOperation.Temperature1.U.Actual',
-    'FirstStage.CombinerOperation.Temperature2.U.Actual',
-    'FirstStage.CombinerOperation.Temperature3.C.Actual',
+RESPONSE_COLS = [
+    'GT_Compressor_decay_state_coefficient',
+    'GT_Turbine_decay_state_coefficient',
 ]
-N_RESPONSES = 15
+# 상수 컬럼(분산 0)과 완전 중복 컬럼은 입력에서 제외한다.
+DROP_COLS = [
+    'GT_Compressor_inlet_air_temp_T1',      # 항상 288.0
+    'GT_Compressor_inlet_air_pressure_P1',  # 항상 0.998
+    'Port_Propeller_Torque_Tp',             # Starboard_Propeller_Torque_Ts 와 동일
+]
 
 TRAIN_RATIO = 0.7
 SPLIT_SEED = 0
@@ -64,7 +54,7 @@ INNER_SPLIT_SEED = 1
 
 ALPHA_PEEL = 0.05
 MIN_SUPPORT = 250
-S_OPTIONS = (22, 27, 33)
+S_OPTIONS = (7, 9, 10)
 T_PER_SIZE = 250
 SEED_PRIM = 1
 
@@ -73,7 +63,7 @@ RHO_LIMIT = 0.6
 K_GRID_STEP = 20
 
 MIN_SUPPORT2_FLOOR = 20
-RATIO2_GRID = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]   # 콘크리트에서 채택한 0.4 포함해 재스윕
+RATIO2_GRID = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 # RATIO2 선택 제약: D_valid 만 최대화하면 항상 그리드 최솟값이 뽑히므로,
 # 수축 후에도 남아야 할 validation 표본 수의 하한을 함께 건다.
@@ -93,41 +83,27 @@ def split_indices(indices, train_ratio, seed):
     return indices[perm[:n_train]], indices[perm[n_train:]]
 
 
-# ============================================= 다중반응 desirability (원논문 식1)
+# ============================================= 다중반응 desirability (원논문 식1, LTB)
 def build_multi_desirability(df, idx):
-    """학습 인덱스에서만 desirability 경계와 target을 추정한다."""
+    """학습 인덱스에서만 LTB desirability 경계를 추정한다."""
     idx = np.asarray(idx, dtype=int)
-    d_list, targets = [], []
-    for i in range(N_RESPONSES):
-        y_all = df[f'Stage1.Output.Measurement{i}.U.Actual'].values.astype(float)
-        y = y_all[idx]
-        sp = df[f'Stage1.Output.Measurement{i}.U.Setpoint'].iloc[idx]
-        nonzero = sp[sp != 0]
-        target = float(nonzero.mode().iloc[0]) if len(nonzero) else float(sp.mean())
-        lower, upper = float(y.min()), float(y.max())
-        if upper <= target or target <= lower:
-            target = float(np.median(y))
-        targets.append((target, lower, upper))
-        d = np.zeros_like(y)
-        m1 = (y >= lower) & (y <= target)
-        d[m1] = (y[m1] - lower) / (target - lower) if target > lower else 1.0
-        m2 = (y > target) & (y <= upper)
-        d[m2] = (upper - y[m2]) / (upper - target) if upper > target else 1.0
-        d_list.append(np.clip(d, 1e-6, 1.0))
-    D_mat = np.column_stack(d_list)
-    D_agg = np.exp(np.mean(np.log(D_mat), axis=1))
-    return D_agg, targets
+    bounds = []
+    for col in RESPONSE_COLS:
+        y = df[col].values.astype(float)[idx]
+        bounds.append((float(y.min()), float(y.max())))
+    return desirability_from_bounds(df, idx, bounds), bounds
 
 
-def desirability_from_targets(df, idx, targets):
+def desirability_from_bounds(df, idx, bounds):
+    """LTB: 1.0(정상)에 가까울수록 desirability 가 높다."""
+    idx = np.asarray(idx, dtype=int)
     d_list = []
-    for i, (target, lower, upper) in enumerate(targets):
-        y = df[f'Stage1.Output.Measurement{i}.U.Actual'].values.astype(float)[idx]
-        d = np.zeros_like(y)
-        m1 = (y >= lower) & (y <= target)
-        d[m1] = (y[m1] - lower) / (target - lower) if target > lower else 1.0
-        m2 = (y > target) & (y <= upper)
-        d[m2] = (upper - y[m2]) / (upper - target) if upper > target else 1.0
+    for col, (lower, upper) in zip(RESPONSE_COLS, bounds):
+        y = df[col].values.astype(float)[idx]
+        if upper > lower:
+            d = (y - lower) / (upper - lower)
+        else:
+            d = np.ones_like(y)
         d_list.append(np.clip(d, 1e-6, 1.0))
     D_mat = np.column_stack(d_list)
     return np.exp(np.mean(np.log(D_mat), axis=1))
@@ -184,7 +160,7 @@ def boxes_cache_path(label, X, D):
         digest.update(str(contiguous.shape).encode())
         digest.update(str(contiguous.dtype).encode())
         digest.update(contiguous.tobytes())
-    return os.path.join(CACHE_DIR, f'factory_{label}_{digest.hexdigest()[:16]}.npy')
+    return os.path.join(CACHE_DIR, f'naval_{label}_{digest.hexdigest()[:16]}.npy')
 
 
 def load_or_build_boxes(label, X, D):
@@ -365,7 +341,8 @@ def evaluate_on_confirmation(clusters, boxes, X_train, D_train,
     print(f'\n  {"클러스터":>7} {"멤버":>4} {"n_box":>6} {"min_sup2":>8} '
           f'{"D_conf(전)":>11} {"D_conf(후)":>11} {"개선폭":>8} '
           f'{"n_conf(전)":>10} {"n_conf(후)":>10}')
-    diffs, improved = [], 0
+    diffs, weights, improved = [], [], 0
+    first_result = None
     for cid, mem in clusters:
         all_idx = np.concatenate([boxes[i]['idx'] for i in mem])
         lo0, hi0 = X_train[all_idx].min(axis=0), X_train[all_idx].max(axis=0)
@@ -378,9 +355,13 @@ def evaluate_on_confirmation(clusters, boxes, X_train, D_train,
         d_before, n_before = holdout_eval(lo0, hi0, X_confirm, D_confirm)
         d_after, n_after = holdout_eval(lo, hi, X_confirm, D_confirm)
 
+        if first_result is None:
+            first_result = (cid, lo0, hi0, lo, hi)
+
         diff = d_after - d_before if not (np.isnan(d_before) or np.isnan(d_after)) else float('nan')
         if not np.isnan(diff):
             diffs.append(diff)
+            weights.append(n_after)
             if diff > 0:
                 improved += 1
         print(f'  {cid:>7} {len(mem):>4} {n_box:>6} {min_support2:>8} '
@@ -388,18 +369,26 @@ def evaluate_on_confirmation(clusters, boxes, X_train, D_train,
               f'{n_before:>10} {n_after:>10}')
 
     if diffs:
+        weighted = np.average(diffs, weights=weights) if np.sum(weights) > 0 else float('nan')
         print(f'\n  → 개선된 클러스터: {improved}/{len(diffs)} '
-              f'({100 * improved / len(diffs):.1f}%), 평균 개선폭={np.mean(diffs):+.4f}')
+              f'({100 * improved / len(diffs):.1f}%), 평균 개선폭={np.mean(diffs):+.4f}, '
+              f'표본가중 개선폭={weighted:+.4f}')
+
+    return first_result
 
 
 # ============================================= 실행
 def main():
     if not os.path.exists(CSV_PATH):
-        raise FileNotFoundError('continuous_factory_process.csv 를 같은 폴더에 두세요.')
+        raise FileNotFoundError('저장소 루트에 naval_propulsion_dataset.csv 를 두세요.')
     df = pd.read_csv(CSV_PATH)
-    X_all = df[INPUT_COLS].values.astype(float)
+
+    feat_names = [c for c in df.columns
+                  if c not in RESPONSE_COLS and c not in DROP_COLS]
+    X_all = df[feat_names].values.astype(float)
     n = len(df)
-    print(f'데이터 {n}행, 입력 {X_all.shape[1]}개, 반응 {N_RESPONSES}개(다중반응)')
+    print(f'데이터 {n}행, 입력 {len(feat_names)}개'
+          f'(상수/중복 {len(DROP_COLS)}개 제외), 반응 {len(RESPONSE_COLS)}개(LTB 다중반응)')
 
     outer_train_idx, confirm_idx = split_indices(
         np.arange(n), TRAIN_RATIO, SPLIT_SEED)
@@ -412,9 +401,9 @@ def main():
 
     # ---------- inner validation에서 RATIO2 선택 ----------
     X_inner_train = X_all[inner_train_idx]
-    D_inner_train, inner_targets = build_multi_desirability(df, inner_train_idx)
+    D_inner_train, inner_bounds = build_multi_desirability(df, inner_train_idx)
     X_validation = X_all[validation_idx]
-    D_validation = desirability_from_targets(df, validation_idx, inner_targets)
+    D_validation = desirability_from_bounds(df, validation_idx, inner_bounds)
 
     print('\n[1] inner training 데이터로 RATIO2 선택용 MRS-PRIM 박스 생성')
     inner_boxes = load_or_build_boxes('inner', X_inner_train, D_inner_train)
@@ -431,9 +420,9 @@ def main():
 
     # ---------- outer training 전체로 최종 파이프라인 재구축 ----------
     X_outer_train = X_all[outer_train_idx]
-    D_outer_train, outer_targets = build_multi_desirability(df, outer_train_idx)
+    D_outer_train, outer_bounds = build_multi_desirability(df, outer_train_idx)
     X_confirm = X_all[confirm_idx]
-    D_confirm = desirability_from_targets(df, confirm_idx, outer_targets)
+    D_confirm = desirability_from_bounds(df, confirm_idx, outer_bounds)
 
     print('\n[3] outer training 전체로 최종 MRS-PRIM 재구축')
     outer_boxes = load_or_build_boxes('outer', X_outer_train, D_outer_train)
@@ -443,9 +432,17 @@ def main():
           f'(N_eff={outer_final[2]}, ECC={outer_final[3]:.4f}, '
           f'rho_eff={outer_final[4]:.3f})')
 
-    evaluate_on_confirmation(
+    first_result = evaluate_on_confirmation(
         outer_clusters, outer_boxes, X_outer_train, D_outer_train,
         X_confirm, D_confirm, best_ratio2)
+
+    if first_result is not None:
+        cid, lo0, hi0, lo, hi = first_result
+        print(f'\n  [클러스터 {cid}] 단일 대표 운전구간 (통합 전 → 2차 PRIM 후)')
+        print(f'  {"변수":>38} {"통합(전)":>24} {"2차 PRIM(후)":>24}')
+        for p, nm in enumerate(feat_names):
+            print(f'  {nm:>38} [{lo0[p]:>10.3f},{hi0[p]:>10.3f}] '
+                  f'[{lo[p]:>10.3f},{hi[p]:>10.3f}]')
 
     print('\n완료. (RATIO2 선택=inner validation, 최종 평가=outer confirmation)')
 

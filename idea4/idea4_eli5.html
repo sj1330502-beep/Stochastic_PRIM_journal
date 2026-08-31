@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>아이디어 4 — 아주 쉽게 이해하기</title>
+<style>
+  :root {
+    --ink:#183153; --muted:#61738b; --paper:#f6f8fc; --card:#fff;
+    --blue:#3b82f6; --green:#22a06b; --red:#e05252; --yellow:#f4b740;
+    --purple:#8b5cf6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI","Noto Sans KR",sans-serif}
+  main{max-width:1100px;margin:auto;padding:44px 24px 60px}
+  h1{font-size:clamp(34px,6vw,62px);line-height:1.12;text-align:center;margin:0 0 12px}
+  .lead{text-align:center;font-size:clamp(18px,2.5vw,27px);color:var(--muted);margin-bottom:42px}
+  section{background:var(--card);border-radius:28px;padding:32px;margin:24px 0;box-shadow:0 10px 30px #18315312}
+  h2{font-size:clamp(24px,3vw,35px);margin:0 0 24px;text-align:center}
+  .row{display:flex;align-items:center;justify-content:center;gap:22px;flex-wrap:wrap}
+  .panel{flex:1 1 280px;min-height:245px;border:3px solid #dbe4f0;border-radius:24px;padding:22px;text-align:center}
+  .emoji{font-size:74px;line-height:1.15}
+  .big{font-weight:800;font-size:clamp(24px,3.7vw,40px);line-height:1.25;margin:12px 0}
+  .small{font-size:19px;color:var(--muted);line-height:1.55}
+  .arrow{font-size:48px;color:var(--blue);font-weight:900}
+  .truth{border-color:#9adbbf;background:#f0fff8}
+  .found{border-color:#f1b1b1;background:#fff5f5}
+  .mixed{border-color:#c8b2ff;background:#f8f5ff}
+  .score{border-color:#a9c8ff;background:#f3f7ff}
+  .strip{height:82px;border-radius:18px;margin:18px auto;max-width:310px;position:relative;overflow:hidden;background:#e8edf4}
+  .strip.one::after{content:"";position:absolute;left:20%;right:20%;top:0;bottom:0;background:var(--green)}
+  .strip.three{background:linear-gradient(90deg,var(--green) 0 18%,#e8edf4 18% 33%,var(--green) 33% 51%,#e8edf4 51% 72%,var(--green) 72% 90%,#e8edf4 90%)}
+  .pieces{display:flex;justify-content:center;gap:5px;flex-wrap:wrap;max-width:340px;margin:15px auto}
+  .piece{width:24px;height:34px;border-radius:6px;background:var(--red)}
+  .bridge{height:82px;border-radius:18px;margin:18px auto;max-width:310px;background:linear-gradient(90deg,var(--purple),#d8c9ff,var(--purple),#d8c9ff,var(--purple));border:6px solid var(--purple)}
+  .formula{font-size:clamp(23px,3.6vw,45px);font-weight:900;text-align:center;padding:22px;border-radius:18px;background:#f7f9fc;line-height:1.45}
+  .bad{color:var(--red)} .good{color:var(--green)} .purple{color:var(--purple)}
+  .bottom{border:4px solid var(--yellow);background:#fffaf0}
+  .bottom p{font-size:clamp(21px,2.8vw,32px);font-weight:750;text-align:center;line-height:1.55;margin:10px}
+  .note{text-align:center;color:var(--muted);font-size:18px;line-height:1.6;margin-top:22px}
+  @media(max-width:700px){.arrow{transform:rotate(90deg)}section{padding:24px 16px}.panel{min-height:220px}}
+</style>
+</head>
+<body>
+<main>
+  <h1>아이디어 4는<br>“정답 모양 찾기 시험”</h1>
+  <p class="lead">컴퓨터가 좋은 영역의 개수와 연결 모양까지 제대로 찾는지 시험했습니다.</p>
+
+  <section>
+    <h2>① 넓게 이어진 정답은 너무 잘게 쪼갰습니다</h2>
+    <div class="row">
+      <div class="panel truth">
+        <div class="emoji">🟩</div>
+        <div class="big good">진짜 정답: 1개</div>
+        <div class="strip one"></div>
+        <div class="small">하나로 이어진 넓은 좋은 영역</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="panel found">
+        <div class="emoji">🧩</div>
+        <div class="big bad">컴퓨터: 평균 47개</div>
+        <div class="pieces">
+          <span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span><span class="piece"></span>
+        </div>
+        <div class="small">깨끗한 작은 조각으로 과도하게 분할</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>② 떨어진 정답은 서로 섞어서 잡았습니다</h2>
+    <div class="row">
+      <div class="panel truth">
+        <div class="emoji">🟩　🟩　🟩</div>
+        <div class="big good">진짜 정답: 3개</div>
+        <div class="strip three"></div>
+        <div class="small">사이에 나쁜 구간이 있는 세 영역</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="panel mixed">
+        <div class="emoji">🌉</div>
+        <div class="big purple">컴퓨터: 평균 46.4개</div>
+        <div class="bridge"></div>
+        <div class="small">모든 유효 클러스터가 세 정답과 겹침<br>중간의 나쁜 구간까지 함께 포함할 수 있음</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>③ 기존 점수만으로는 이 문제를 알기 어렵습니다</h2>
+    <div class="formula">ECC = “같은 묶음의 박스가 서로 닮았나?”<br><span class="bad">≠ “진짜 영역 모양을 정확히 찾았나?”</span></div>
+    <p class="note">ECC가 높아도 실제 영역 개수나 연결 모양은 틀릴 수 있습니다.<br>N_eff도 실제 독립 고성능 영역 수로 바로 해석하면 안 됩니다.</p>
+  </section>
+
+  <section class="bottom">
+    <h2>한마디로</h2>
+    <p>이어진 좋은 영역은 <span class="bad">너무 잘게 나누고</span>,<br>떨어진 좋은 영역은 <span class="purple">서로 섞을 수 있습니다.</span></p>
+    <p>그래서 산업 현장에 쓰기 전에는<br>박스 사이 조건까지 별도 실험으로 확인해야 합니다.</p>
+  </section>
+</main>
+</body>
+</html>

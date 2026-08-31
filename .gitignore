@@ -1,0 +1,12 @@
+# Claude Code local state
+.claude/
+
+# Local JavaScript dependencies
+node_modules/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Duplicate local dataset copy (canonical copy is tracked elsewhere)
+idea1/naval_propulsion_dataset.csv
